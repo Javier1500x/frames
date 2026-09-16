@@ -29,9 +29,7 @@
 ══════════════════════════════════════ -->
 <section id="hero-scroll">
 	<div id="hero-sticky">
-		<video id="hv" muted playsinline preload="auto"
-			src="https://javier1500x.github.io/Educ-In/Video%20Dron%20Capilla.mp4"
-			style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;background:#0a0a08;"></video>
+		<canvas id="hv" style="position:absolute;inset:0;width:100%;height:100%;display:block;background:#0a0a08;"></canvas>
 		<div id="hv-grad"></div>
 		<div id="hero-text">
 			<p class="h-eyebrow">Maldives · Est. 2019</p>
@@ -586,8 +584,6 @@ HERO — TALL SCROLL CONTAINER
 	inset: 0;
 	width: 100%;
 	height: 100%;
-	object-fit: cover;
-	/* paused immediately via JS after load */
 	will-change: transform;
 }
 
@@ -1819,11 +1815,28 @@ RESPONSIVE
     if (window.gsap && window.ScrollTrigger) { gsap.registerPlugin(ScrollTrigger); }
 
 /* ══════════════════════════════════════
-   HERO VIDEO SETUP (scroll-scrubbed MP4)
+   HERO FRAME SEQUENCE SETUP (scroll-scrubbed image sequence)
+   Reemplaza el <video> + currentTime-seek (que causaba el lag)
+   por una secuencia de JPGs precargados y dibujados en <canvas>.
+   Scroll → índice de array → drawImage. Sin seeks, sin decode.
 ══════════════════════════════════════ */
 const hv = document.getElementById("hv");
+const hvCtx = hv.getContext("2d");
+
+// Ruta base + cantidad de frames de la secuencia (frame_0001.jpg ... frame_0191.jpg)
+const FRAME_BASE = "https://javier1500x.github.io/Educ-In/frames/frame_";
+const FRAME_COUNT = 191;
+const FRAME_PAD = 4; // frame_0001.jpg
+
+function frameSrc(i) {
+	return FRAME_BASE + String(i).padStart(FRAME_PAD, "0") + ".jpg";
+}
+
+const frames = new Array(FRAME_COUNT);
+let loadedCount = 0;
 let videoReady = false;
 let canvasReady = false; // bandera: hero listo (reutilizada por el fallback)
+let currentFrameIndex = 0;
 
 const loader = document.getElementById("loader");
 const loaderBar = document.getElementById("loader-bar");
@@ -1851,38 +1864,61 @@ function dismissLoader() {
 	setTimeout(startHeroEntrance, 400);
 }
 
-// Progreso falso + por tiempo: la barra nunca se congela
-let fakeP = 0;
-const t0 = Date.now();
-const fakeInterval = setInterval(() => {
-	if (!videoReady) {
-		fakeP = Math.min(fakeP + Math.random() * 3, 90);
-		const elapsed = (Date.now() - t0) / 1000;
-		setProgress(Math.max(fakeP, Math.min(90, (elapsed / 18) * 90)));
-	} else {
-		clearInterval(fakeInterval);
+function resizeCanvas() {
+	hv.width = hv.clientWidth * (window.devicePixelRatio || 1);
+	hv.height = hv.clientHeight * (window.devicePixelRatio || 1);
+	drawFrame(currentFrameIndex);
+}
+
+// Dibuja un frame con "object-fit: cover" manual sobre el canvas
+function drawFrame(index) {
+	const img = frames[index];
+	if (!img || !img.complete || !img.naturalWidth) return;
+	currentFrameIndex = index;
+	const cw = hv.width, ch = hv.height;
+	const iw = img.naturalWidth, ih = img.naturalHeight;
+	const scale = Math.max(cw / iw, ch / ih);
+	const dw = iw * scale, dh = ih * scale;
+	const dx = (cw - dw) / 2, dy = (ch - dh) / 2;
+	hvCtx.clearRect(0, 0, cw, ch);
+	hvCtx.drawImage(img, dx, dy, dw, dh);
+}
+
+// Precarga todos los frames. La primera imagen desbloquea el hero
+// (para no bloquear toda la carga en conexiones lentas); el resto
+// sigue cargando en segundo plano mientras el usuario ya ve la página.
+function preloadFrames() {
+	for (let i = 0; i < FRAME_COUNT; i++) {
+		const img = new Image();
+		img.decoding = "async";
+		img.onload = img.onerror = () => {
+			loadedCount++;
+			const pct = (loadedCount / FRAME_COUNT) * 100;
+			if (!videoReady) setProgress(Math.min(90, pct), statuses[Math.min(3, Math.floor(pct / 30))]);
+			if (i === 0) {
+				resizeCanvas();
+			}
+			if (loadedCount === FRAME_COUNT && !videoReady) {
+				videoReady = true;
+				setProgress(100, statuses[3]);
+				setTimeout(dismissLoader, 300);
+			}
+		};
+		img.src = frameSrc(i + 1);
+		frames[i] = img;
 	}
-}, 200);
+}
 
-// Cuando el video puede reproducirse → terminar carga
-hv.addEventListener("canplaythrough", () => {
-	if (videoReady) return;
-	videoReady = true;
-	setProgress(100, statuses[3]);
-	setTimeout(dismissLoader, 400);
-});
+window.addEventListener("resize", resizeCanvas);
+preloadFrames();
 
-// Si el video falla (404, red, formato), no dejar la página colgada
-hv.addEventListener("error", () => {
-	if (videoReady) return;
-	videoReady = true;
-	setProgress(100, statuses[3]);
-	setTimeout(dismissLoader, 300);
-});
+// El primer frame puede tardar un pelín; si en 2s ya cargó, mostramos algo
+setTimeout(() => { if (frames[0] && frames[0].complete) resizeCanvas(); }, 300);
 
-// Fallback absoluto: entrar igual después de 12 s
+// Fallback absoluto: entrar igual después de 12 s aunque no haya terminado todo
 setTimeout(() => {
 	if (!canvasReady) {
+		videoReady = true;
 		setProgress(100, statuses[3]);
 		dismissLoader();
 	}
@@ -1938,33 +1974,22 @@ function initScrollTrigger() {
 	const scrollInd = document.getElementById("sind");
 	const grad = document.getElementById("hv-grad");
 
-	// Scrub optimizado: nunca se encolan seeks — se espera al 'seeked'
-	// y se guarda solo el último destino pedido (el intermedio sobra)
-	let seeking = false;
-	let pendingTime = null;
+	// Scrub optimizado: solo mapea progreso → índice de frame y
+	// pinta con requestAnimationFrame. Sin seeks, sin decode de video.
+	let targetIndex = 0;
+	let rafQueued = false;
 
-	hv.addEventListener("seeked", () => {
-		seeking = false;
-		if (pendingTime !== null) {
-			const t = pendingTime;
-			pendingTime = null;
-			if (Math.abs(hv.currentTime - t) > 0.03) {
-				hv.currentTime = t;
-				seeking = true;
-			}
-		}
-	});
+	function renderQueued() {
+		rafQueued = false;
+		drawFrame(targetIndex);
+	}
 
 	function scrubTo(p) {
-		if (!hv.duration || !isFinite(hv.duration)) return;
-		const t = p * hv.duration;
-		if (seeking) {
-			pendingTime = t; // destino pendiente, se aplica al terminar el seek actual
-			return;
-		}
-		if (Math.abs(hv.currentTime - t) > 0.03) {
-			hv.currentTime = t;
-			seeking = true;
+		const idx = Math.min(FRAME_COUNT - 1, Math.max(0, Math.round(p * (FRAME_COUNT - 1))));
+		targetIndex = idx;
+		if (!rafQueued) {
+			rafQueued = true;
+			requestAnimationFrame(renderQueued);
 		}
 	}
 
